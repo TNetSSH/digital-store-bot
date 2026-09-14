@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.1 — 2026-09-14
+
+- Corrigida a inicialização em Python 3.10, versão padrão do Ubuntu 22.04.
+- CI agora valida automaticamente Python 3.10 e Python 3.12.
+
 ## 1.1.0 — 2026-09-14
 
 - Adicionados estoque ilimitado, por quantidade e por itens únicos.

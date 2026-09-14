@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiohttp
@@ -38,7 +38,9 @@ class MercadoPagoClient:
         payer_first_name: str,
     ) -> Record:
         self.ensure_ready()
-        expiration = datetime.now(UTC) + timedelta(minutes=self.config.pix_expiration_minutes)
+        expiration = datetime.now(timezone.utc) + timedelta(
+            minutes=self.config.pix_expiration_minutes
+        )
         body = {
             "transaction_amount": cents_to_api_amount(int(order["amount"])),
             "description": product_description[:255],

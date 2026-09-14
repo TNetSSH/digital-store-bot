@@ -1,4 +1,4 @@
-# Digital Store Bot 1.1.0
+# Digital Store Bot 1.1.1
 
 Bot de vendas para conversas privadas no Telegram, com catálogo personalizável,
 pagamento único e entrega automática de textos, arquivos e links.
@@ -29,7 +29,7 @@ um produto.
 ## Requisitos
 
 - Ubuntu 22.04 ou superior.
-- Python 3.11 ou superior.
+- Python 3.10 ou superior.
 - Token criado no `@BotFather`.
 - ID numérico do administrador.
 - Domínio HTTPS público para receber notificações do Mercado Pago, caso use PIX.
