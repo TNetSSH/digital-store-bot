@@ -1,0 +1,26 @@
+[Unit]
+Description=Digital Store Bot Telegram
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=digitalstore
+Group=digitalstore
+WorkingDirectory=/opt/digital-store-bot
+EnvironmentFile=/opt/digital-store-bot/.env
+ExecStart=/opt/digital-store-bot/.venv/bin/python -m bot
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGINT
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/digital-store-bot/data
+
+[Install]
+WantedBy=multi-user.target
+
