@@ -1,4 +1,4 @@
-# Digital Store Bot 1.1.1
+# Digital Store Bot 1.1.2
 
 Bot de vendas para conversas privadas no Telegram, com catálogo personalizável,
 pagamento único e entrega automática de textos, arquivos e links.

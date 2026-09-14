@@ -9,6 +9,8 @@ from bot.config import Config
 from bot.database import Record
 from bot.utils.money import cents_to_api_amount
 
+MERCADO_PAGO_BRAZIL_TIMEZONE = timezone(timedelta(hours=-3))
+
 
 class MercadoPagoError(RuntimeError):
     pass
@@ -16,6 +18,17 @@ class MercadoPagoError(RuntimeError):
 
 class MercadoPagoNotConfigured(MercadoPagoError):
     pass
+
+
+def format_mercado_pago_datetime(value: datetime) -> str:
+    """Format a datetime exactly as required by Mercado Pago's Payments API."""
+    if value.tzinfo is None:
+        raise ValueError("datetime must include timezone information")
+    return (
+        value.astimezone(MERCADO_PAGO_BRAZIL_TIMEZONE)
+        .replace(microsecond=0)
+        .isoformat(timespec="milliseconds")
+    )
 
 
 class MercadoPagoClient:
@@ -47,7 +60,7 @@ class MercadoPagoClient:
             "payment_method_id": "pix",
             "external_reference": order["public_id"],
             "notification_url": f"{self.config.public_base_url}/webhooks/mercadopago",
-            "date_of_expiration": expiration.isoformat(timespec="seconds"),
+            "date_of_expiration": format_mercado_pago_datetime(expiration),
             "payer": {
                 "email": self.config.mercado_pago_payer_email,
                 "first_name": payer_first_name[:100] or "Cliente",

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.2 — 2026-09-14
+
+- Corrigido o formato de `date_of_expiration` na criação de pagamentos PIX.
+- A data agora inclui milissegundos e o fuso brasileiro exigidos pelo Mercado Pago.
+- O relógio da VPS pode permanecer configurado em UTC.
+
 ## 1.1.1 — 2026-09-14
 
 - Corrigida a inicialização em Python 3.10, versão padrão do Ubuntu 22.04.

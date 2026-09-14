@@ -1,8 +1,9 @@
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 
-from bot.services.mercadopago import MercadoPagoClient
+from bot.services.mercadopago import MercadoPagoClient, format_mercado_pago_datetime
 
 
 class FakeResponse:
@@ -28,7 +29,7 @@ class FakeSession:
 
 
 @pytest.mark.asyncio
-async def test_pix_expiration_uses_timezone_aware_utc_datetime():
+async def test_pix_expiration_uses_mercado_pago_format():
     config = SimpleNamespace(
         mercado_pago_ready=True,
         mercado_pago_missing=(),
@@ -47,4 +48,17 @@ async def test_pix_expiration_uses_timezone_aware_utc_datetime():
     )
 
     body = session.request_data[2]["json"]
-    assert body["date_of_expiration"].endswith("+00:00")
+    expiration = body["date_of_expiration"]
+    assert expiration.endswith(".000-03:00")
+    assert datetime.fromisoformat(expiration).tzinfo is not None
+
+
+def test_mercado_pago_datetime_converts_utc_and_includes_milliseconds():
+    value = datetime(2026, 9, 14, 22, 13, 8, tzinfo=timezone.utc)
+
+    assert format_mercado_pago_datetime(value) == "2026-09-14T19:13:08.000-03:00"
+
+
+def test_mercado_pago_datetime_rejects_naive_values():
+    with pytest.raises(ValueError, match="timezone"):
+        format_mercado_pago_datetime(datetime(2026, 9, 14, 22, 13, 8))
