@@ -9,7 +9,7 @@ from aiogram import Bot
 from aiogram.types import Message, PreCheckoutQuery, SuccessfulPayment
 
 from bot.config import Config
-from bot.database import Database, Record
+from bot.database import Database, Record, StockReservationError
 from bot.services.delivery import DeliveryService
 from bot.services.mercadopago import MercadoPagoClient
 from bot.utils.money import InvalidMoney, external_amount_to_cents
@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 
 
 class PaymentValidationError(RuntimeError):
+    pass
+
+
+class StockPaymentError(PaymentValidationError):
     pass
 
 
@@ -62,6 +66,8 @@ class PaymentProcessor:
             return False, "Este pedido pertence a outro usuário."
         if query.currency != "XTR" or query.total_amount != int(order["amount"]):
             return False, "O valor do pedido mudou. Gere uma nova cobrança."
+        if not await self.db.ensure_order_reservation(int(order["id"])):
+            return False, "A reserva expirou ou o produto esgotou. Gere uma nova cobrança."
         return True, ""
 
     async def process_stars(self, message: Message, payment: SuccessfulPayment) -> bool:
@@ -84,15 +90,20 @@ class PaymentProcessor:
             if existing_charge and existing_charge != payment.telegram_payment_charge_id:
                 raise PaymentValidationError("pedido possui outro identificador Stars")
             if not already_approved:
-                await self.db.approve_stars_order(
-                    int(order["id"]),
-                    telegram_charge_id=payment.telegram_payment_charge_id,
-                    provider_charge_id=payment.provider_payment_charge_id,
-                )
+                try:
+                    await self.db.approve_stars_order(
+                        int(order["id"]),
+                        telegram_charge_id=payment.telegram_payment_charge_id,
+                        provider_charge_id=payment.provider_payment_charge_id,
+                    )
+                except StockReservationError as exc:
+                    await self._notify_stock_problem(order)
+                    raise StockPaymentError(str(exc)) from exc
                 await self.bot.send_message(
                     message.chat.id,
                     f"✅ Pagamento aprovado: <b>{escape(str(order['product_name']))}</b>.",
                 )
+                await self._notify_low_stock(order)
             current = await self.db.get_order_by_id(int(order["id"]))
             if current:
                 await self.delivery.deliver_order(current)
@@ -136,13 +147,18 @@ class PaymentProcessor:
             detail = str(payment.get("status_detail") or "")
             was_approved = order["status"] == "approved"
             if local_status == "approved":
-                await self.db.approve_pix_order(int(order["id"]), external_id)
+                try:
+                    await self.db.approve_pix_order(int(order["id"]), external_id)
+                except StockReservationError as exc:
+                    await self._notify_stock_problem(order)
+                    raise StockPaymentError(str(exc)) from exc
                 if not was_approved:
                     await self._remove_pix_qr(order)
                     await self.bot.send_message(
                         int(order["telegram_user_id"]),
                         f"✅ PIX aprovado: <b>{escape(str(order['product_name']))}</b>.",
                     )
+                    await self._notify_low_stock(order)
                 current = await self.db.get_order_by_id(int(order["id"]))
                 if current:
                     await self.delivery.deliver_order(current)
@@ -173,6 +189,42 @@ class PaymentProcessor:
             except Exception:  # pragma: no cover
                 logger.exception("failed to notify admin about reversed PIX")
 
+    async def _notify_low_stock(self, order: Record) -> None:
+        try:
+            available = await self.db.claim_low_stock_alert(int(order["product_id"]))
+        except Exception:  # pragma: no cover - checkout must continue if alerting fails
+            logger.exception("failed to calculate low stock alert")
+            return
+        if available is None:
+            return
+        text = (
+            "⚠️ <b>Estoque baixo</b>\n\n"
+            f"Produto: {escape(str(order['product_name']))}\n"
+            f"Disponível: <b>{available}</b>"
+        )
+        for admin_id in self.config.admin_ids:
+            try:
+                await self.bot.send_message(admin_id, text)
+            except Exception:  # pragma: no cover - depends on Telegram availability
+                logger.exception("failed to notify admin about low stock")
+
+    async def _notify_stock_problem(self, order: Record) -> None:
+        await self.bot.send_message(
+            int(order["telegram_user_id"]),
+            "⚠️ O pagamento foi confirmado, mas a reserva de estoque precisa de revisão. "
+            "O administrador já foi avisado.",
+        )
+        text = (
+            "🚨 <b>Pagamento aprovado sem reserva de estoque</b>\n\n"
+            f"Pedido: <code>{order['public_id']}</code>\n"
+            f"Produto: {escape(str(order['product_name']))}"
+        )
+        for admin_id in self.config.admin_ids:
+            try:
+                await self.bot.send_message(admin_id, text)
+            except Exception:  # pragma: no cover
+                logger.exception("failed to notify admin about stock reservation")
+
     @staticmethod
     def _stars_public_id(payload: str) -> str | None:
         prefix = "dsb:"
@@ -198,5 +250,12 @@ class PaymentProcessor:
             raise PaymentValidationError("moeda do pagamento nao confere")
         if int(order["amount"]) != amount:
             raise PaymentValidationError("valor do pagamento nao confere")
-        if order["status"] in {"cancelled", "rejected", "refunded", "charged_back"}:
+        if order["status"] in {
+            "cancelled",
+            "rejected",
+            "refunded",
+            "charged_back",
+            "expired",
+            "error",
+        }:
             raise PaymentValidationError("pedido nao pode mais ser aprovado")

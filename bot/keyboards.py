@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from aiogram.types import InlineKeyboardMarkup
 
-from bot.database import Record
+from bot.database import Record, product_has_stock
 from bot.utils.buttons import button
 
 
@@ -63,7 +63,11 @@ def products_keyboard(
     rows = [
         [
             button(
-                product["button_text"],
+                (
+                    str(product["button_text"])
+                    if product_has_stock(product)
+                    else f"{product['button_text']} · Esgotado"
+                )[:64],
                 callback_data=f"store:product:{product['id']}",
                 style=product["button_style"],
                 emoji_id=product["button_emoji_id"],

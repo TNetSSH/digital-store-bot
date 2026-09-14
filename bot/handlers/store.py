@@ -8,7 +8,7 @@ from aiogram.filters import CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
 from bot.config import Config
-from bot.database import Database
+from bot.database import Database, product_has_fulfillment, product_has_stock
 from bot.keyboards import (
     back_button,
     categories_keyboard,
@@ -136,7 +136,14 @@ async def product(callback: CallbackQuery, bot: Bot, db: Database) -> None:
         text += f"\n\n{selected['description']}"
     if prices:
         text += "\n\n<b>Preço:</b> " + " ou ".join(prices)
-    if not selected["delivery_count"]:
+    in_stock = product_has_stock(selected)
+    if selected["stock_mode"] != "unlimited":
+        available = int(selected["stock_available"])
+        text += f"\n<b>Estoque disponível:</b> {available}"
+    if not in_stock:
+        text += "\n\n❌ <b>Produto esgotado.</b>"
+        stars_enabled = pix_enabled = False
+    elif not product_has_fulfillment(selected):
         text += "\n\n⚠️ Temporariamente indisponível para compra."
         stars_enabled = pix_enabled = False
     elif not prices:

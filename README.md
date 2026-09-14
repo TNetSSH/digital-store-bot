@@ -1,4 +1,4 @@
-# Digital Store Bot 1.0.0
+# Digital Store Bot 1.1.0
 
 Bot de vendas para conversas privadas no Telegram, com catálogo personalizável,
 pagamento único e entrega automática de textos, arquivos e links.
@@ -13,6 +13,8 @@ pagamento único e entrega automática de textos, arquivos e links.
 - Validação de usuário, moeda, valor e identificador antes da entrega.
 - Entrega idempotente de vários textos, arquivos e links na ordem definida.
 - Área **Minhas compras** com reenvio do conteúdo.
+- Estoque ilimitado, por quantidade ou composto por itens únicos.
+- Reserva transacional, bloqueio automático de produtos esgotados e alerta de estoque baixo.
 - Painel administrativo dentro do próprio Telegram.
 - Banco SQLite em modo WAL e serviço HTTP local para healthcheck/webhook.
 - Operação somente em conversa privada; não há lógica de grupos ou moderação.
@@ -132,11 +134,34 @@ O painel não permite ativá-lo enquanto alguma configuração obrigatória esti
 1. Envie `/admin` no privado.
 2. Cadastre uma categoria; ela começa oculta.
 3. Cadastre um produto e defina os preços.
-4. Abra **Conteúdos de entrega** e adicione textos, arquivos ou links.
-5. Publique o produto.
-6. Publique a categoria.
+4. Abra **Estoque** e escolha o modo desejado.
+5. Abra **Conteúdos de entrega** e adicione textos, arquivos ou links.
+6. Publique o produto.
+7. Publique a categoria.
 
-Um produto só pode ser publicado se possuir conteúdo e ao menos um preço habilitado.
+Um produto só pode ser publicado se possuir conteúdo (ou itens únicos) e ao menos um preço
+habilitado.
+
+## Controle de estoque
+
+Cada produto possui um dos seguintes modos:
+
+- **Ilimitado:** não controla quantidade e permite vendas contínuas.
+- **Por quantidade:** o administrador informa quantas unidades estão disponíveis.
+- **Itens únicos:** cada linha cadastrada representa um código, conta, licença ou link exclusivo.
+
+No modo de itens únicos, envie até 500 itens por mensagem, usando uma linha para cada item. O
+bot reserva uma linha diferente para cada pedido e entrega esse conteúdo automaticamente após
+a aprovação. Em **Minhas compras**, o comprador sempre recebe novamente o mesmo item.
+
+Uma unidade é reservada antes da cobrança. Pedidos expirados, cancelados ou que falharem
+devolvem automaticamente a unidade ao estoque; pagamentos aprovados consomem a reserva. Isso
+impede duas compras simultâneas da última unidade. Quando o saldo chega a zero, os botões de
+pagamento são bloqueados e o produto aparece como esgotado.
+
+O limite de estoque baixo é configurável por produto. O aviso é enviado uma única vez aos
+administradores e volta a ser habilitado quando o estoque é reabastecido. Itens reservados ou
+vendidos são preservados e não podem ser excluídos pelo painel.
 
 ## Personalização de botões
 
@@ -194,4 +219,6 @@ python -m bot
 - Conferência de referência externa, método, moeda e valor.
 - Chaves de idempotência na criação do PIX.
 - Identificadores únicos e registro por item para impedir entregas repetidas.
+- Reserva de estoque em transação SQLite antes de gerar a cobrança.
+- Entrega idempotente do item exclusivo associado ao pedido.
 - Painel limitado aos IDs presentes em `ADMIN_IDS`.

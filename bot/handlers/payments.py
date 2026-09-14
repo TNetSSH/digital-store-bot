@@ -15,14 +15,19 @@ from aiogram.types import (
 )
 
 from bot.config import Config
-from bot.database import Database
+from bot.database import (
+    Database,
+    OutOfStockError,
+    product_has_fulfillment,
+    product_has_stock,
+)
 from bot.services.mercadopago import (
     MercadoPagoClient,
     MercadoPagoError,
     MercadoPagoNotConfigured,
     pix_transaction_data,
 )
-from bot.services.payments import PaymentProcessor, PaymentValidationError
+from bot.services.payments import PaymentProcessor, PaymentValidationError, StockPaymentError
 from bot.utils.buttons import button
 from bot.utils.money import format_brl
 from bot.utils.text import shorten, strip_html
@@ -33,7 +38,12 @@ router = Router(name="payments")
 
 async def _sellable_product(db: Database, product_id: int):
     product = await db.get_product(product_id)
-    if product is None or not product["is_visible"] or not product["delivery_count"]:
+    if (
+        product is None
+        or not product["is_visible"]
+        or not product_has_stock(product)
+        or not product_has_fulfillment(product)
+    ):
         return None
     category = await db.get_category(int(product["category_id"]))
     if category is None or not category["is_visible"]:
@@ -57,13 +67,18 @@ async def pay_stars(callback: CallbackQuery, bot: Bot, db: Database) -> None:
     await db.upsert_user(
         callback.from_user.id, callback.from_user.first_name, callback.from_user.username
     )
-    order = await db.create_order(
-        telegram_user_id=callback.from_user.id,
-        product=product,
-        payment_method="stars",
-        amount=int(product["price_stars"]),
-        currency="XTR",
-    )
+    try:
+        order = await db.create_order(
+            telegram_user_id=callback.from_user.id,
+            product=product,
+            payment_method="stars",
+            amount=int(product["price_stars"]),
+            currency="XTR",
+            reservation_minutes=30,
+        )
+    except OutOfStockError:
+        await callback.answer("Produto esgotado.", show_alert=True)
+        return
     pay_button = button(
         settings["stars_text"],
         pay=True,
@@ -71,22 +86,26 @@ async def pay_stars(callback: CallbackQuery, bot: Bot, db: Database) -> None:
         emoji_id=settings["stars_emoji_id"],
     )
     await callback.answer()
-    await bot.send_invoice(
-        chat_id=callback.from_user.id,
-        title=shorten(strip_html(str(product["name"])), 32),
-        description=shorten(strip_html(str(product["description"] or product["name"])), 255),
-        payload=f"dsb:{order['public_id']}",
-        provider_token="",
-        currency="XTR",
-        prices=[
-            LabeledPrice(
-                label=shorten(strip_html(str(product["name"])), 32),
-                amount=order["amount"],
-            )
-        ],
-        start_parameter=f"product_{product_id}",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[pay_button]]),
-    )
+    try:
+        await bot.send_invoice(
+            chat_id=callback.from_user.id,
+            title=shorten(strip_html(str(product["name"])), 32),
+            description=shorten(strip_html(str(product["description"] or product["name"])), 255),
+            payload=f"dsb:{order['public_id']}",
+            provider_token="",
+            currency="XTR",
+            prices=[
+                LabeledPrice(
+                    label=shorten(strip_html(str(product["name"])), 32),
+                    amount=order["amount"],
+                )
+            ],
+            start_parameter=f"product_{product_id}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[pay_button]]),
+        )
+    except Exception:
+        await db.update_order_status(int(order["id"]), "error", "telegram_invoice_send_failed")
+        raise
 
 
 @router.callback_query(F.data.startswith("pay:pix:"))
@@ -114,13 +133,18 @@ async def pay_pix(
     await db.upsert_user(
         callback.from_user.id, callback.from_user.first_name, callback.from_user.username
     )
-    order = await db.create_order(
-        telegram_user_id=callback.from_user.id,
-        product=product,
-        payment_method="pix",
-        amount=int(product["price_brl_cents"]),
-        currency="BRL",
-    )
+    try:
+        order = await db.create_order(
+            telegram_user_id=callback.from_user.id,
+            product=product,
+            payment_method="pix",
+            amount=int(product["price_brl_cents"]),
+            currency="BRL",
+            reservation_minutes=config.pix_expiration_minutes,
+        )
+    except OutOfStockError:
+        await callback.answer("Produto esgotado.", show_alert=True)
+        return
     await callback.answer("Gerando PIX…")
     try:
         payment = await mercado_pago.create_pix_payment(
@@ -224,6 +248,8 @@ async def successful_stars(
 ) -> None:
     try:
         await processor.process_stars(message, message.successful_payment)
+    except StockPaymentError:
+        logger.exception("Stars payment arrived without a valid stock reservation")
     except PaymentValidationError:
         logger.exception("invalid Stars payment received")
         await message.answer(

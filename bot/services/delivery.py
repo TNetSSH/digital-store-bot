@@ -31,11 +31,25 @@ class DeliveryService:
             if current is None or current["status"] != "approved":
                 return False
             items = await self.db.list_delivery_items(int(current["product_id"]))
-            if not items:
+            stock_item = (
+                await self.db.get_order_stock_item(order_id)
+                if current["stock_mode"] == "unique"
+                else None
+            )
+            if not items and stock_item is None:
                 await self._notify_missing_content(current)
                 return False
 
             sent_any = False
+            if stock_item is not None and (force or not current["stock_item_delivered_at"]):
+                message = await self.bot.send_message(
+                    int(current["telegram_user_id"]),
+                    "🔑 <b>Seu item exclusivo:</b>\n\n"
+                    f"<pre>{escape(str(stock_item['value']))}</pre>",
+                )
+                sent_any = True
+                if not force:
+                    await self.db.mark_stock_item_delivered(order_id, message.message_id)
             for item in items:
                 if not force and await self.db.delivery_was_sent(order_id, int(item["id"])):
                     continue

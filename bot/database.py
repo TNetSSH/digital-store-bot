@@ -11,6 +11,31 @@ import aiosqlite
 
 Record = dict[str, Any]
 
+STOCK_MODES = {"unlimited", "quantity", "unique"}
+
+
+class OutOfStockError(RuntimeError):
+    """Raised when a limited product cannot reserve another unit."""
+
+
+class StockReservationError(RuntimeError):
+    """Raised when an order no longer owns a valid stock reservation."""
+
+
+class StockModeChangeError(RuntimeError):
+    """Raised when stock mode cannot be changed safely."""
+
+
+def product_has_stock(product: Record) -> bool:
+    return product.get("stock_mode") == "unlimited" or int(product.get("stock_available", 0)) > 0
+
+
+def product_has_fulfillment(product: Record) -> bool:
+    return int(product.get("delivery_count", 0)) > 0 or (
+        product.get("stock_mode") == "unique" and product_has_stock(product)
+    )
+
+
 DEFAULT_SETTINGS: dict[str, str] = {
     "welcome_text": (
         "<b>Digital Store</b>\n\n"
@@ -81,6 +106,11 @@ CREATE TABLE IF NOT EXISTS products (
     price_brl_cents INTEGER NOT NULL DEFAULT 0 CHECK (price_brl_cents >= 0),
     allow_stars INTEGER NOT NULL DEFAULT 1 CHECK (allow_stars IN (0, 1)),
     allow_pix INTEGER NOT NULL DEFAULT 0 CHECK (allow_pix IN (0, 1)),
+    stock_mode TEXT NOT NULL DEFAULT 'unlimited'
+        CHECK (stock_mode IN ('unlimited', 'quantity', 'unique')),
+    stock_quantity INTEGER NOT NULL DEFAULT 0 CHECK (stock_quantity >= 0),
+    low_stock_threshold INTEGER NOT NULL DEFAULT 3 CHECK (low_stock_threshold >= 0),
+    stock_alerted INTEGER NOT NULL DEFAULT 0 CHECK (stock_alerted IN (0, 1)),
     position INTEGER NOT NULL DEFAULT 0,
     is_visible INTEGER NOT NULL DEFAULT 0 CHECK (is_visible IN (0, 1)),
     is_archived INTEGER NOT NULL DEFAULT 0 CHECK (is_archived IN (0, 1)),
@@ -115,11 +145,30 @@ CREATE TABLE IF NOT EXISTS orders (
     external_payment_id TEXT UNIQUE,
     telegram_charge_id TEXT UNIQUE,
     provider_charge_id TEXT,
+    stock_mode TEXT NOT NULL DEFAULT 'unlimited'
+        CHECK (stock_mode IN ('unlimited', 'quantity', 'unique')),
+    stock_state TEXT NOT NULL DEFAULT 'none'
+        CHECK (stock_state IN ('none', 'reserved', 'consumed', 'released')),
+    reservation_expires_at TEXT,
+    stock_item_delivered_at TEXT,
+    stock_item_message_id INTEGER,
     payment_message_chat_id INTEGER,
     payment_message_id INTEGER,
     delivered_at TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS stock_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    value TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'available'
+        CHECK (status IN ('available', 'reserved', 'sold')),
+    order_id INTEGER UNIQUE REFERENCES orders(id),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(product_id, value)
 );
 
 CREATE TABLE IF NOT EXISTS delivery_log (
@@ -140,6 +189,8 @@ CREATE INDEX IF NOT EXISTS idx_orders_user
     ON orders(telegram_user_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_status
     ON orders(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_stock_items_product
+    ON stock_items(product_id, status, id);
 """
 
 
@@ -168,6 +219,7 @@ class Database:
         "price_brl_cents",
         "allow_stars",
         "allow_pix",
+        "low_stock_threshold",
         "is_visible",
     }
 
@@ -183,6 +235,7 @@ class Database:
         await self.connection.execute("PRAGMA journal_mode = WAL")
         await self.connection.execute("PRAGMA busy_timeout = 5000")
         await self.connection.executescript(SCHEMA)
+        await self._migrate_stock_schema()
         settings = dict(DEFAULT_SETTINGS)
         settings["stars_enabled"] = "1" if stars_enabled else "0"
         settings["pix_enabled"] = "1" if pix_enabled else "0"
@@ -190,6 +243,47 @@ class Database:
             "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", settings.items()
         )
         await self.connection.commit()
+
+    async def _migrate_stock_schema(self) -> None:
+        """Upgrade databases created by versions older than 1.1.0 in place."""
+
+        db = self._db()
+        migrations = {
+            "products": {
+                "stock_mode": (
+                    "TEXT NOT NULL DEFAULT 'unlimited' "
+                    "CHECK (stock_mode IN ('unlimited', 'quantity', 'unique'))"
+                ),
+                "stock_quantity": "INTEGER NOT NULL DEFAULT 0 CHECK (stock_quantity >= 0)",
+                "low_stock_threshold": (
+                    "INTEGER NOT NULL DEFAULT 3 CHECK (low_stock_threshold >= 0)"
+                ),
+                "stock_alerted": ("INTEGER NOT NULL DEFAULT 0 CHECK (stock_alerted IN (0, 1))"),
+            },
+            "orders": {
+                "stock_mode": (
+                    "TEXT NOT NULL DEFAULT 'unlimited' "
+                    "CHECK (stock_mode IN ('unlimited', 'quantity', 'unique'))"
+                ),
+                "stock_state": (
+                    "TEXT NOT NULL DEFAULT 'none' "
+                    "CHECK (stock_state IN ('none', 'reserved', 'consumed', 'released'))"
+                ),
+                "reservation_expires_at": "TEXT",
+                "stock_item_delivered_at": "TEXT",
+                "stock_item_message_id": "INTEGER",
+            },
+        }
+        for table, columns in migrations.items():
+            async with db.execute(f"PRAGMA table_info({table})") as cursor:
+                existing = {str(row[1]) for row in await cursor.fetchall()}
+            for column, definition in columns.items():
+                if column not in existing:
+                    await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_stock "
+            "ON orders(stock_state, reservation_expires_at)"
+        )
 
     async def close(self) -> None:
         if self.connection is not None:
@@ -214,6 +308,12 @@ class Database:
             cursor = await self._db().execute(sql, tuple(params))
             await self._db().commit()
             return int(cursor.lastrowid or 0)
+
+    async def _execute_affected(self, sql: str, params: Iterable[Any] = ()) -> int:
+        async with self._write_lock:
+            cursor = await self._db().execute(sql, tuple(params))
+            await self._db().commit()
+            return max(cursor.rowcount, 0)
 
     async def get_setting(self, key: str, default: str = "") -> str:
         row = await self._fetchone("SELECT value FROM settings WHERE key = ?", (key,))
@@ -323,6 +423,7 @@ class Database:
     async def list_products(
         self, *, category_id: int | None = None, visible_only: bool = False
     ) -> list[Record]:
+        await self.release_expired_reservations()
         clauses = ["p.is_archived = 0"]
         params: list[Any] = []
         if category_id is not None:
@@ -334,7 +435,17 @@ class Database:
             f"""
             SELECT p.*, c.name AS category_name,
                 (SELECT COUNT(*) FROM delivery_items d WHERE d.product_id = p.id)
-                AS delivery_count
+                    AS delivery_count,
+                CASE p.stock_mode
+                    WHEN 'unlimited' THEN -1
+                    WHEN 'quantity' THEN p.stock_quantity
+                    ELSE (SELECT COUNT(*) FROM stock_items si
+                          WHERE si.product_id = p.id AND si.status = 'available')
+                END AS stock_available,
+                (SELECT COUNT(*) FROM orders o
+                 WHERE o.product_id = p.id AND o.stock_state = 'reserved') AS stock_reserved,
+                (SELECT COUNT(*) FROM orders o
+                 WHERE o.product_id = p.id AND o.stock_state = 'consumed') AS stock_sold
             FROM products p
             JOIN categories c ON c.id = p.category_id
             WHERE {" AND ".join(clauses)}
@@ -344,11 +455,22 @@ class Database:
         )
 
     async def get_product(self, product_id: int) -> Record | None:
+        await self.release_expired_reservations(product_id=product_id)
         return await self._fetchone(
             """
             SELECT p.*, c.name AS category_name,
                 (SELECT COUNT(*) FROM delivery_items d WHERE d.product_id = p.id)
-                AS delivery_count
+                    AS delivery_count,
+                CASE p.stock_mode
+                    WHEN 'unlimited' THEN -1
+                    WHEN 'quantity' THEN p.stock_quantity
+                    ELSE (SELECT COUNT(*) FROM stock_items si
+                          WHERE si.product_id = p.id AND si.status = 'available')
+                END AS stock_available,
+                (SELECT COUNT(*) FROM orders o
+                 WHERE o.product_id = p.id AND o.stock_state = 'reserved') AS stock_reserved,
+                (SELECT COUNT(*) FROM orders o
+                 WHERE o.product_id = p.id AND o.stock_state = 'consumed') AS stock_sold
             FROM products p JOIN categories c ON c.id = p.category_id
             WHERE p.id = ? AND p.is_archived = 0
             """,
@@ -405,6 +527,263 @@ class Database:
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?""",  # noqa: S608
             (value, product_id),
         )
+
+    async def set_stock_mode(self, product_id: int, mode: str) -> None:
+        if mode not in STOCK_MODES:
+            raise ValueError("modo de estoque invalido")
+        await self.release_expired_reservations(product_id=product_id)
+        async with self._write_lock:
+            db = self._db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    "SELECT stock_mode FROM products WHERE id = ? AND is_archived = 0",
+                    (product_id,),
+                ) as cursor:
+                    product = await cursor.fetchone()
+                if product is None:
+                    raise ValueError("produto nao encontrado")
+                if str(product["stock_mode"]) != mode:
+                    async with db.execute(
+                        """
+                        SELECT COUNT(*) FROM orders
+                        WHERE product_id = ? AND stock_state = 'reserved'
+                        """,
+                        (product_id,),
+                    ) as cursor:
+                        reserved = int((await cursor.fetchone())[0])
+                    if reserved:
+                        raise StockModeChangeError(
+                            "aguarde ou cancele as reservas pendentes antes de mudar o modo"
+                        )
+                await db.execute(
+                    """
+                    UPDATE products SET stock_mode = ?, stock_alerted = 0,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE id = ?
+                    """,
+                    (mode, product_id),
+                )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def set_quantity_stock(self, product_id: int, quantity: int) -> None:
+        if quantity < 0:
+            raise ValueError("a quantidade nao pode ser negativa")
+        await self.release_expired_reservations(product_id=product_id)
+        affected = await self._execute_affected(
+            """
+            UPDATE products SET stock_quantity = ?, stock_alerted = 0,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ? AND stock_mode = 'quantity' AND is_archived = 0
+            """,
+            (quantity, product_id),
+        )
+        if affected != 1:
+            raise ValueError("selecione o modo por quantidade primeiro")
+
+    async def set_low_stock_threshold(self, product_id: int, threshold: int) -> None:
+        if threshold < 0:
+            raise ValueError("o limite de aviso nao pode ser negativo")
+        await self.update_product(product_id, "low_stock_threshold", threshold)
+        await self._execute("UPDATE products SET stock_alerted = 0 WHERE id = ?", (product_id,))
+
+    async def add_unique_stock_items(
+        self, product_id: int, values: Iterable[str]
+    ) -> tuple[int, int]:
+        supplied_values = [value.strip() for value in values if value.strip()]
+        unique_values = list(dict.fromkeys(supplied_values))
+        if not unique_values:
+            raise ValueError("envie ao menos um item")
+        if any(len(value) > 3500 for value in unique_values):
+            raise ValueError("cada item deve possuir no maximo 3500 caracteres")
+        await self.release_expired_reservations(product_id=product_id)
+        async with self._write_lock:
+            db = self._db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    "SELECT stock_mode FROM products WHERE id = ? AND is_archived = 0",
+                    (product_id,),
+                ) as cursor:
+                    product = await cursor.fetchone()
+                if product is None or product["stock_mode"] != "unique":
+                    raise ValueError("selecione o modo de itens unicos primeiro")
+                added = 0
+                for value in unique_values:
+                    cursor = await db.execute(
+                        """
+                        INSERT OR IGNORE INTO stock_items(product_id, value)
+                        VALUES (?, ?)
+                        """,
+                        (product_id, value),
+                    )
+                    added += max(cursor.rowcount, 0)
+                if added:
+                    await db.execute(
+                        "UPDATE products SET stock_alerted = 0 WHERE id = ?", (product_id,)
+                    )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+        return added, len(supplied_values) - added
+
+    async def list_available_stock_items(self, product_id: int, limit: int = 30) -> list[Record]:
+        await self.release_expired_reservations(product_id=product_id)
+        return await self._fetchall(
+            """
+            SELECT * FROM stock_items
+            WHERE product_id = ? AND status = 'available'
+            ORDER BY id LIMIT ?
+            """,
+            (product_id, limit),
+        )
+
+    async def delete_available_stock_item(self, product_id: int, item_id: int) -> bool:
+        affected = await self._execute_affected(
+            """
+            DELETE FROM stock_items
+            WHERE id = ? AND product_id = ? AND status = 'available'
+            """,
+            (item_id, product_id),
+        )
+        return affected == 1
+
+    async def clear_available_stock_items(self, product_id: int) -> int:
+        return await self._execute_affected(
+            "DELETE FROM stock_items WHERE product_id = ? AND status = 'available'",
+            (product_id,),
+        )
+
+    async def get_order_stock_item(self, order_id: int) -> Record | None:
+        return await self._fetchone(
+            """
+            SELECT * FROM stock_items
+            WHERE order_id = ? AND status IN ('reserved', 'sold')
+            """,
+            (order_id,),
+        )
+
+    async def mark_stock_item_delivered(self, order_id: int, message_id: int) -> None:
+        await self._execute(
+            """
+            UPDATE orders SET
+                stock_item_delivered_at = COALESCE(
+                    stock_item_delivered_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                ),
+                stock_item_message_id = COALESCE(stock_item_message_id, ?),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ?
+            """,
+            (message_id, order_id),
+        )
+
+    async def release_expired_reservations(self, *, product_id: int | None = None) -> int:
+        params: list[Any] = []
+        product_clause = ""
+        if product_id is not None:
+            product_clause = " AND product_id = ?"
+            params.append(product_id)
+        async with self._write_lock:
+            db = self._db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    f"""
+                    SELECT id, product_id, stock_mode FROM orders
+                    WHERE stock_state = 'reserved' AND status = 'pending'
+                      AND reservation_expires_at IS NOT NULL
+                      AND reservation_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                      {product_clause}
+                    """,  # noqa: S608
+                    params,
+                ) as cursor:
+                    expired = await cursor.fetchall()
+                for order in expired:
+                    if order["stock_mode"] == "quantity":
+                        await db.execute(
+                            """
+                            UPDATE products SET stock_quantity = stock_quantity + 1,
+                                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                            WHERE id = ?
+                            """,
+                            (order["product_id"],),
+                        )
+                    elif order["stock_mode"] == "unique":
+                        await db.execute(
+                            """
+                            UPDATE stock_items SET status = 'available', order_id = NULL,
+                                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                            WHERE order_id = ? AND status = 'reserved'
+                            """,
+                            (order["id"],),
+                        )
+                    await db.execute(
+                        """
+                        UPDATE orders SET status = 'expired', stock_state = 'released',
+                            status_detail = 'stock_reservation_expired',
+                            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                        WHERE id = ? AND stock_state = 'reserved'
+                        """,
+                        (order["id"],),
+                    )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+        return len(expired)
+
+    async def ensure_order_reservation(self, order_id: int) -> bool:
+        await self.release_expired_reservations()
+        order = await self.get_order_by_id(order_id)
+        if order is None or order["status"] != "pending":
+            return False
+        if order["stock_mode"] == "unlimited":
+            return order["stock_state"] == "none"
+        return order["stock_state"] == "reserved"
+
+    async def claim_low_stock_alert(self, product_id: int) -> int | None:
+        await self.release_expired_reservations(product_id=product_id)
+        async with self._write_lock:
+            db = self._db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    """
+                    SELECT stock_mode, stock_quantity, low_stock_threshold, stock_alerted
+                    FROM products WHERE id = ?
+                    """,
+                    (product_id,),
+                ) as cursor:
+                    product = await cursor.fetchone()
+                if product is None or product["stock_mode"] == "unlimited":
+                    await db.commit()
+                    return None
+                if product["stock_mode"] == "quantity":
+                    available = int(product["stock_quantity"])
+                else:
+                    async with db.execute(
+                        """
+                        SELECT COUNT(*) FROM stock_items
+                        WHERE product_id = ? AND status = 'available'
+                        """,
+                        (product_id,),
+                    ) as cursor:
+                        available = int((await cursor.fetchone())[0])
+                if available > int(product["low_stock_threshold"]) or product["stock_alerted"]:
+                    await db.commit()
+                    return None
+                await db.execute(
+                    "UPDATE products SET stock_alerted = 1 WHERE id = ?", (product_id,)
+                )
+                await db.commit()
+                return available
+            except Exception:
+                await db.rollback()
+                raise
 
     async def archive_product(self, product_id: int) -> None:
         await self._execute(
@@ -539,25 +918,100 @@ class Database:
         payment_method: str,
         amount: int,
         currency: str,
+        reservation_minutes: int = 30,
     ) -> Record:
+        if reservation_minutes < 1:
+            raise ValueError("o tempo de reserva deve ser positivo")
+        await self.release_expired_reservations(product_id=int(product["id"]))
         public_id = str(uuid.uuid4())
-        order_id = await self._execute(
-            """
-            INSERT INTO orders(
-                public_id, telegram_user_id, product_id, product_name,
-                payment_method, amount, currency
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                public_id,
-                telegram_user_id,
-                product["id"],
-                product["name"],
-                payment_method,
-                amount,
-                currency,
-            ),
-        )
+        async with self._write_lock:
+            db = self._db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    """
+                    SELECT id, name, stock_mode, stock_quantity
+                    FROM products WHERE id = ? AND is_archived = 0
+                    """,
+                    (product["id"],),
+                ) as cursor:
+                    current = await cursor.fetchone()
+                if current is None:
+                    raise ValueError("produto nao encontrado")
+                stock_mode = str(current["stock_mode"])
+                stock_state = "none" if stock_mode == "unlimited" else "reserved"
+                stock_item_id: int | None = None
+                if stock_mode == "quantity" and int(current["stock_quantity"]) <= 0:
+                    raise OutOfStockError("produto esgotado")
+                if stock_mode == "unique":
+                    async with db.execute(
+                        """
+                        SELECT id FROM stock_items
+                        WHERE product_id = ? AND status = 'available'
+                        ORDER BY id LIMIT 1
+                        """,
+                        (product["id"],),
+                    ) as cursor:
+                        stock_item = await cursor.fetchone()
+                    if stock_item is None:
+                        raise OutOfStockError("produto esgotado")
+                    stock_item_id = int(stock_item["id"])
+
+                expires_modifier = f"+{reservation_minutes} minutes"
+                cursor = await db.execute(
+                    """
+                    INSERT INTO orders(
+                        public_id, telegram_user_id, product_id, product_name,
+                        payment_method, amount, currency, stock_mode, stock_state,
+                        reservation_expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        CASE WHEN ? = 'reserved'
+                            THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)
+                            ELSE NULL
+                        END
+                    )
+                    """,
+                    (
+                        public_id,
+                        telegram_user_id,
+                        current["id"],
+                        current["name"],
+                        payment_method,
+                        amount,
+                        currency,
+                        stock_mode,
+                        stock_state,
+                        stock_state,
+                        expires_modifier,
+                    ),
+                )
+                order_id = int(cursor.lastrowid)
+                if stock_mode == "quantity":
+                    cursor = await db.execute(
+                        """
+                        UPDATE products SET stock_quantity = stock_quantity - 1,
+                            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                        WHERE id = ? AND stock_mode = 'quantity' AND stock_quantity > 0
+                        """,
+                        (current["id"],),
+                    )
+                    if cursor.rowcount != 1:
+                        raise OutOfStockError("produto esgotado")
+                elif stock_mode == "unique":
+                    cursor = await db.execute(
+                        """
+                        UPDATE stock_items SET status = 'reserved', order_id = ?,
+                            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                        WHERE id = ? AND status = 'available'
+                        """,
+                        (order_id, stock_item_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise OutOfStockError("produto esgotado")
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
         order = await self.get_order_by_id(order_id)
         if order is None:
             raise RuntimeError("pedido criado mas nao encontrado")
@@ -597,14 +1051,52 @@ class Database:
     async def update_order_status(
         self, order_id: int, status: str, status_detail: str = ""
     ) -> None:
-        await self._execute(
-            """
-            UPDATE orders SET status = ?, status_detail = ?,
-                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE id = ?
-            """,
-            (status, status_detail, order_id),
-        )
+        release = status in {"error", "expired", "rejected", "cancelled"}
+        async with self._write_lock:
+            db = self._db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    "SELECT product_id, stock_mode, stock_state FROM orders WHERE id = ?",
+                    (order_id,),
+                ) as cursor:
+                    order = await cursor.fetchone()
+                if order is None:
+                    await db.rollback()
+                    return
+                if release and order["stock_state"] == "reserved":
+                    if order["stock_mode"] == "quantity":
+                        await db.execute(
+                            """
+                            UPDATE products SET stock_quantity = stock_quantity + 1,
+                                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                            WHERE id = ?
+                            """,
+                            (order["product_id"],),
+                        )
+                    elif order["stock_mode"] == "unique":
+                        await db.execute(
+                            """
+                            UPDATE stock_items SET status = 'available', order_id = NULL,
+                                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                            WHERE order_id = ? AND status = 'reserved'
+                            """,
+                            (order_id,),
+                        )
+                stock_state = "released" if release and order["stock_state"] == "reserved" else None
+                await db.execute(
+                    """
+                    UPDATE orders SET status = ?, status_detail = ?,
+                        stock_state = COALESCE(?, stock_state),
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE id = ?
+                    """,
+                    (status, status_detail, stock_state, order_id),
+                )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
 
     async def approve_stars_order(
         self,
@@ -613,26 +1105,73 @@ class Database:
         telegram_charge_id: str,
         provider_charge_id: str,
     ) -> None:
-        await self._execute(
-            """
-            UPDATE orders SET status = 'approved', status_detail = '',
-                telegram_charge_id = ?, provider_charge_id = ?,
-                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE id = ?
-            """,
-            (telegram_charge_id, provider_charge_id, order_id),
+        await self._approve_order(
+            order_id,
+            telegram_charge_id=telegram_charge_id,
+            provider_charge_id=provider_charge_id,
         )
 
     async def approve_pix_order(self, order_id: int, payment_id: str) -> None:
-        await self._execute(
-            """
-            UPDATE orders SET status = 'approved', status_detail = '',
-                external_payment_id = ?,
-                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE id = ?
-            """,
-            (payment_id, order_id),
-        )
+        await self._approve_order(order_id, external_payment_id=payment_id)
+
+    async def _approve_order(
+        self,
+        order_id: int,
+        *,
+        telegram_charge_id: str | None = None,
+        provider_charge_id: str | None = None,
+        external_payment_id: str | None = None,
+    ) -> None:
+        async with self._write_lock:
+            db = self._db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)) as cursor:
+                    order = await cursor.fetchone()
+                if order is None:
+                    raise ValueError("pedido nao encontrado")
+                if order["status"] == "approved" and order["stock_state"] in {
+                    "none",
+                    "consumed",
+                }:
+                    await db.commit()
+                    return
+                if order["stock_mode"] != "unlimited" and order["stock_state"] != "reserved":
+                    raise StockReservationError("a reserva de estoque deste pedido expirou")
+                if order["stock_mode"] == "unique":
+                    cursor = await db.execute(
+                        """
+                        UPDATE stock_items SET status = 'sold',
+                            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                        WHERE order_id = ? AND status = 'reserved'
+                        """,
+                        (order_id,),
+                    )
+                    if cursor.rowcount != 1:
+                        raise StockReservationError("item exclusivo reservado nao encontrado")
+                stock_state = "none" if order["stock_mode"] == "unlimited" else "consumed"
+                await db.execute(
+                    """
+                    UPDATE orders SET status = 'approved', status_detail = '',
+                        telegram_charge_id = COALESCE(?, telegram_charge_id),
+                        provider_charge_id = COALESCE(?, provider_charge_id),
+                        external_payment_id = COALESCE(?, external_payment_id),
+                        stock_state = ?,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE id = ?
+                    """,
+                    (
+                        telegram_charge_id,
+                        provider_charge_id,
+                        external_payment_id,
+                        stock_state,
+                        order_id,
+                    ),
+                )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
 
     async def list_user_purchases(self, telegram_user_id: int, limit: int = 30) -> list[Record]:
         return await self._fetchall(
@@ -676,9 +1215,11 @@ class Database:
             """
             SELECT
                 (SELECT COUNT(*) FROM delivery_items d WHERE d.product_id = o.product_id)
-                    AS expected,
+                    + CASE WHEN o.stock_mode = 'unique' AND o.stock_state = 'consumed'
+                        THEN 1 ELSE 0 END AS expected,
                 (SELECT COUNT(*) FROM delivery_log l WHERE l.order_id = o.id)
-                    AS delivered
+                    + CASE WHEN o.stock_item_delivered_at IS NOT NULL
+                        THEN 1 ELSE 0 END AS delivered
             FROM orders o WHERE o.id = ?
             """,
             (order_id,),

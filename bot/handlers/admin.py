@@ -11,7 +11,12 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
 from bot.config import Config
-from bot.database import Database, Record
+from bot.database import (
+    Database,
+    Record,
+    StockModeChangeError,
+    product_has_fulfillment,
+)
 from bot.services.delivery import DeliveryService
 from bot.states import AdminInput
 from bot.ui import replace_menu
@@ -40,6 +45,12 @@ STYLE_LABELS = {
     "primary": "Azul",
     "success": "Verde",
     "danger": "Vermelho",
+}
+
+STOCK_LABELS = {
+    "unlimited": "Ilimitado",
+    "quantity": "Por quantidade",
+    "unique": "Itens únicos",
 }
 
 
@@ -74,6 +85,16 @@ def _yes_no(value: object) -> str:
 def _content_name(item: Record) -> str:
     names = {"text": "Texto", "file": "Arquivo", "link": "Link"}
     return f"#{item['position']} · {names.get(item['kind'], item['kind'])}"
+
+
+def _stock_summary(item: Record) -> str:
+    mode = str(item["stock_mode"])
+    if mode == "unlimited":
+        return "Ilimitado"
+    return (
+        f"{STOCK_LABELS[mode]} · {item['stock_available']} disponível(is) · "
+        f"{item['stock_reserved']} reservado(s) · {item['stock_sold']} vendido(s)"
+    )
 
 
 async def _admin_home(callback: CallbackQuery, bot: Bot, db: Database) -> None:
@@ -325,6 +346,7 @@ async def _product_detail(callback: CallbackQuery, bot: Bot, db: Database, produ
         f"Stars: <b>{item['price_stars']}</b> ({_yes_no(item['allow_stars'])})\n"
         f"PIX: <b>{format_brl(int(item['price_brl_cents']))}</b> "
         f"({_yes_no(item['allow_pix'])})\n"
+        f"Estoque: <b>{escape(_stock_summary(item))}</b>\n"
         f"Conteúdos: <b>{item['delivery_count']}</b>\n"
         f"Botão: {escape(str(item['button_text']))}\n"
         f"Cor: {STYLE_LABELS.get(item['button_style'], item['button_style'])}\n"
@@ -366,6 +388,13 @@ async def _product_detail(callback: CallbackQuery, bot: Bot, db: Database, produ
             button(
                 "Conteúdos de entrega",
                 callback_data=f"admin:contents:{product_id}",
+                style="primary",
+            )
+        ],
+        [
+            button(
+                "Estoque",
+                callback_data=f"admin:stock:{product_id}",
                 style="primary",
             )
         ],
@@ -477,6 +506,254 @@ async def product_no_photo(callback: CallbackQuery, bot: Bot, db: Database) -> N
     await _product_detail(callback, bot, db, product_id)
 
 
+async def _stock_detail(callback: CallbackQuery, bot: Bot, db: Database, product_id: int) -> None:
+    item = await db.get_product(product_id)
+    if item is None:
+        await callback.answer("Produto não encontrado.", show_alert=True)
+        return
+    mode = str(item["stock_mode"])
+    text = f"<b>Estoque — {escape(str(item['name']))}</b>\n\nModo: <b>{STOCK_LABELS[mode]}</b>\n"
+    if mode == "unlimited":
+        text += "O produto pode ser vendido sem limite de unidades."
+    else:
+        text += (
+            f"Disponíveis: <b>{item['stock_available']}</b>\n"
+            f"Reservados: <b>{item['stock_reserved']}</b>\n"
+            f"Vendidos: <b>{item['stock_sold']}</b>\n"
+            f"Avisar quando restarem: <b>{item['low_stock_threshold']}</b>"
+        )
+    rows = [
+        [
+            button(
+                "Ilimitado",
+                callback_data=f"admin:stockmode:{product_id}:unlimited",
+                style="success" if mode == "unlimited" else "default",
+            ),
+            button(
+                "Quantidade",
+                callback_data=f"admin:stockmode:{product_id}:quantity",
+                style="success" if mode == "quantity" else "default",
+            ),
+        ],
+        [
+            button(
+                "Itens únicos",
+                callback_data=f"admin:stockmode:{product_id}:unique",
+                style="success" if mode == "unique" else "default",
+            )
+        ],
+    ]
+    if mode == "quantity":
+        rows.append(
+            [
+                button(
+                    "Definir unidades disponíveis",
+                    callback_data=f"admin:stockqty:{product_id}",
+                    style="primary",
+                )
+            ]
+        )
+    elif mode == "unique":
+        rows.extend(
+            [
+                [
+                    button(
+                        "Adicionar itens",
+                        callback_data=f"admin:stockadd:{product_id}",
+                        style="success",
+                    )
+                ],
+                [
+                    button(
+                        "Gerenciar disponíveis",
+                        callback_data=f"admin:stockitems:{product_id}",
+                    )
+                ],
+            ]
+        )
+    if mode != "unlimited":
+        rows.append(
+            [
+                button(
+                    "Limite do aviso",
+                    callback_data=f"admin:stockthreshold:{product_id}",
+                )
+            ]
+        )
+    rows.append([button("Voltar", callback_data=f"admin:product:{product_id}")])
+    await replace_menu(callback, bot, text=text, reply_markup=_markup(rows))
+
+
+@router.callback_query(F.data.startswith("admin:stock:"))
+async def stock_detail(callback: CallbackQuery, bot: Bot, db: Database) -> None:
+    await _stock_detail(callback, bot, db, int(callback.data.rsplit(":", 1)[1]))
+
+
+@router.callback_query(F.data.startswith("admin:stockmode:"))
+async def stock_mode(callback: CallbackQuery, bot: Bot, db: Database) -> None:
+    _, _, raw_id, mode = callback.data.split(":")
+    product_id = int(raw_id)
+    try:
+        await db.set_stock_mode(product_id, mode)
+    except (ValueError, StockModeChangeError) as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+    await _stock_detail(callback, bot, db, product_id)
+
+
+@router.callback_query(F.data.startswith("admin:stockqty:"))
+async def stock_quantity(callback: CallbackQuery, bot: Bot, state: FSMContext) -> None:
+    product_id = int(callback.data.rsplit(":", 1)[1])
+    await state.set_state(AdminInput.waiting)
+    await state.set_data({"action": "stock_quantity", "product_id": product_id})
+    await replace_menu(
+        callback,
+        bot,
+        text=(
+            "Envie a quantidade de unidades <b>disponíveis</b>.\n\n"
+            "As unidades já reservadas por pedidos pendentes não serão alteradas."
+        ),
+        reply_markup=_cancel_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("admin:stockthreshold:"))
+async def stock_threshold(callback: CallbackQuery, bot: Bot, state: FSMContext) -> None:
+    product_id = int(callback.data.rsplit(":", 1)[1])
+    await state.set_state(AdminInput.waiting)
+    await state.set_data({"action": "stock_threshold", "product_id": product_id})
+    await replace_menu(
+        callback,
+        bot,
+        text="Avise o saldo em que deseja receber o alerta de estoque baixo (0 ou mais).",
+        reply_markup=_cancel_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("admin:stockadd:"))
+async def stock_add(callback: CallbackQuery, bot: Bot, state: FSMContext) -> None:
+    product_id = int(callback.data.rsplit(":", 1)[1])
+    await state.set_state(AdminInput.waiting)
+    await state.set_data({"action": "stock_add_items", "product_id": product_id})
+    await replace_menu(
+        callback,
+        bot,
+        text=(
+            "Envie os códigos, contas, licenças ou links. Use <b>um item por linha</b>.\n\n"
+            "Cada compra receberá automaticamente uma linha diferente."
+        ),
+        reply_markup=_cancel_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("admin:stockitems:"))
+async def stock_items(callback: CallbackQuery, bot: Bot, db: Database) -> None:
+    product_id = int(callback.data.rsplit(":", 1)[1])
+    product = await db.get_product(product_id)
+    if product is None:
+        await callback.answer("Produto não encontrado.", show_alert=True)
+        return
+    items = await db.list_available_stock_items(product_id)
+    rows = [
+        [
+            button(
+                f"Remover #{item['id']} · {str(item['value']).replace(chr(10), ' ')[:28]}",
+                callback_data=f"admin:stockitemconfirm:{product_id}:{item['id']}",
+                style="danger",
+            )
+        ]
+        for item in items
+    ]
+    if items:
+        rows.append(
+            [
+                button(
+                    "Remover todos disponíveis",
+                    callback_data=f"admin:stockclearconfirm:{product_id}",
+                    style="danger",
+                )
+            ]
+        )
+    rows.append([button("Voltar", callback_data=f"admin:stock:{product_id}")])
+    text = (
+        f"<b>Itens disponíveis — {escape(str(product['name']))}</b>\n\n"
+        f"Exibindo até 30 de <b>{product['stock_available']}</b>. "
+        "Itens reservados ou vendidos não podem ser removidos."
+    )
+    if not items:
+        text += "\n\nNenhum item disponível."
+    await replace_menu(callback, bot, text=text, reply_markup=_markup(rows))
+
+
+@router.callback_query(F.data.startswith("admin:stockitemconfirm:"))
+async def stock_item_confirm(callback: CallbackQuery, bot: Bot, db: Database) -> None:
+    _, _, raw_product_id, raw_item_id = callback.data.split(":")
+    product_id, item_id = int(raw_product_id), int(raw_item_id)
+    items = await db.list_available_stock_items(product_id, limit=1000)
+    item = next((row for row in items if int(row["id"]) == item_id), None)
+    if item is None:
+        await callback.answer("Item indisponível ou já reservado.", show_alert=True)
+        return
+    await replace_menu(
+        callback,
+        bot,
+        text=f"Remover este item disponível?\n\n<pre>{escape(str(item['value']))}</pre>",
+        reply_markup=_markup(
+            [
+                [
+                    button(
+                        "Confirmar remoção",
+                        callback_data=f"admin:stockitemdelete:{product_id}:{item_id}",
+                        style="danger",
+                    )
+                ],
+                [button("Cancelar", callback_data=f"admin:stockitems:{product_id}")],
+            ]
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("admin:stockitemdelete:"))
+async def stock_item_delete(callback: CallbackQuery, bot: Bot, db: Database) -> None:
+    _, _, raw_product_id, raw_item_id = callback.data.split(":")
+    product_id, item_id = int(raw_product_id), int(raw_item_id)
+    removed = await db.delete_available_stock_item(product_id, item_id)
+    await callback.answer("Item removido." if removed else "Item não pôde ser removido.")
+    callback = callback.model_copy(update={"data": f"admin:stockitems:{product_id}"})
+    await stock_items(callback, bot, db)
+
+
+@router.callback_query(F.data.startswith("admin:stockclearconfirm:"))
+async def stock_clear_confirm(callback: CallbackQuery, bot: Bot) -> None:
+    product_id = int(callback.data.rsplit(":", 1)[1])
+    await replace_menu(
+        callback,
+        bot,
+        text="Remover todos os itens disponíveis? Reservados e vendidos serão preservados.",
+        reply_markup=_markup(
+            [
+                [
+                    button(
+                        "Confirmar remoção",
+                        callback_data=f"admin:stockclear:{product_id}",
+                        style="danger",
+                    )
+                ],
+                [button("Cancelar", callback_data=f"admin:stockitems:{product_id}")],
+            ]
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("admin:stockclear:"))
+async def stock_clear(callback: CallbackQuery, bot: Bot, db: Database) -> None:
+    product_id = int(callback.data.rsplit(":", 1)[1])
+    removed = await db.clear_available_stock_items(product_id)
+    await callback.answer(f"{removed} item(ns) removido(s).")
+    callback = callback.model_copy(update={"data": f"admin:stockitems:{product_id}"})
+    await stock_items(callback, bot, db)
+
+
 @router.callback_query(F.data.startswith("admin:ptogglepay:"))
 async def product_toggle_payment(callback: CallbackQuery, bot: Bot, db: Database) -> None:
     _, _, raw_id, field = callback.data.split(":")
@@ -504,9 +781,10 @@ async def product_toggle(callback: CallbackQuery, bot: Bot, db: Database) -> Non
         valid_price = (item["allow_stars"] and item["price_stars"] > 0) or (
             item["allow_pix"] and item["price_brl_cents"] > 0
         )
-        if not item["delivery_count"] or not valid_price:
+        if not product_has_fulfillment(item) or not valid_price:
             await callback.answer(
-                "Adicione conteúdo e ao menos um pagamento com preço antes de publicar.",
+                "Adicione conteúdo (ou itens únicos) e ao menos um pagamento com preço "
+                "antes de publicar.",
                 show_alert=True,
             )
             return
@@ -1157,6 +1435,37 @@ async def admin_input(message: Message, bot: Bot, db: Database, state: FSMContex
             await state.clear()
             await message.answer("✅ Imagem atualizada.")
             await _send_product_detail(bot, message.from_user.id, db, product_id)
+        elif action == "stock_quantity":
+            quantity = int(_plain_text(message))
+            if not 0 <= quantity <= 1_000_000_000:
+                raise ValueError("a quantidade deve estar entre 0 e 1.000.000.000")
+            product_id = int(data["product_id"])
+            await db.set_quantity_stock(product_id, quantity)
+            await state.clear()
+            await message.answer("✅ Quantidade disponível atualizada.")
+            await _send_stock_detail(bot, message.from_user.id, db, product_id)
+        elif action == "stock_threshold":
+            threshold = int(_plain_text(message))
+            if not 0 <= threshold <= 1_000_000_000:
+                raise ValueError("o limite deve estar entre 0 e 1.000.000.000")
+            product_id = int(data["product_id"])
+            await db.set_low_stock_threshold(product_id, threshold)
+            await state.clear()
+            await message.answer("✅ Limite do aviso atualizado.")
+            await _send_stock_detail(bot, message.from_user.id, db, product_id)
+        elif action == "stock_add_items":
+            raw = _plain_text(message)
+            values = [line.strip() for line in raw.splitlines() if line.strip()]
+            if len(values) > 500:
+                raise ValueError("envie no máximo 500 itens por mensagem")
+            product_id = int(data["product_id"])
+            added, duplicates = await db.add_unique_stock_items(product_id, values)
+            await state.clear()
+            result = f"✅ {added} item(ns) adicionado(s)."
+            if duplicates:
+                result += f" {duplicates} duplicado(s) ignorado(s)."
+            await message.answer(result)
+            await _send_stock_detail(bot, message.from_user.id, db, product_id)
         elif action == "content_text":
             value = _limited(_html_text(message), 4000, "o texto")
             if not value:
@@ -1287,6 +1596,28 @@ async def _send_product_detail(bot: Bot, chat_id: int, db: Database, product_id:
                     button(
                         "Abrir produto",
                         callback_data=f"admin:product:{product_id}",
+                        style="primary",
+                    )
+                ],
+                [button("Painel", callback_data="admin:home")],
+            ]
+        ),
+    )
+
+
+async def _send_stock_detail(bot: Bot, chat_id: int, db: Database, product_id: int) -> None:
+    item = await db.get_product(product_id)
+    if item is None:
+        return
+    await bot.send_message(
+        chat_id,
+        f"Estoque atual: <b>{escape(_stock_summary(item))}</b>",
+        reply_markup=_markup(
+            [
+                [
+                    button(
+                        "Abrir estoque",
+                        callback_data=f"admin:stock:{product_id}",
                         style="primary",
                     )
                 ],
